@@ -1,0 +1,182 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Soft white base with a subtle mint tint */
+    --background: 150 50% 99%;
+    --foreground: 160 40% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 160 40% 10%;
+
+    /* Emerald/teal accent — smooth, modern */
+    --primary: 160 72% 42%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 150 30% 96%;
+    --secondary-foreground: 160 35% 20%;
+
+    --muted: 150 25% 95%;
+    --muted-foreground: 160 10% 38%;
+
+    --accent: 150 40% 92%;
+    --accent-foreground: 160 35% 20%;
+
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 150 30% 90%;
+    --input: 150 30% 90%;
+    --ring: 160 72% 42%;
+
+    --radius: 1rem;
+
+    --over: 160 72% 42%;
+    --under: 0 72% 55%;
+    --live: 12 85% 55%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
+
+  html {
+    color-scheme: light;
+  }
+
+  body {
+    @apply text-foreground antialiased;
+    font-family: 'Manrope', ui-sans-serif, system-ui, sans-serif;
+    font-feature-settings: 'ss01', 'cv11';
+    /* Smooth white → soft green gradient backdrop */
+    background:
+      radial-gradient(1200px 600px at 85% -10%, rgba(16, 185, 129, 0.18), transparent 60%),
+      radial-gradient(900px 500px at 0% 110%, rgba(45, 212, 191, 0.15), transparent 60%),
+      linear-gradient(180deg, #ffffff 0%, #f4fbf6 45%, #e8f7ef 100%);
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.22);
+    color: hsl(var(--foreground));
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: 'Space Grotesk', 'Manrope', ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: -0.01em;
+  }
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .glass {
+    background: rgba(255, 255, 255, 0.65);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+  }
+
+  .gradient-text {
+    background: linear-gradient(135deg, #10b981, #14b8a6, #0ea5a4);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* ── AI pipeline stage animations ── */
+
+  @keyframes stage-enter {
+    from {
+      opacity: 0;
+      transform: translateX(-10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes stage-pop {
+    0% {
+      transform: scale(1);
+    }
+    40% {
+      transform: scale(1.25);
+    }
+    100% {
+      transform: scale(1);
+    }
+  }
+
+  @keyframes stage-shake {
+    0%,
+    100% {
+      transform: translateX(0);
+    }
+    20%,
+    60% {
+      transform: translateX(-3px);
+    }
+    40%,
+    80% {
+      transform: translateX(3px);
+    }
+  }
+
+  @keyframes stage-ripple {
+    0% {
+      box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55);
+    }
+    100% {
+      box-shadow: 0 0 0 14px rgba(16, 185, 129, 0);
+    }
+  }
+
+  @keyframes running-sweep {
+    0% {
+      background-position: 0% 50%;
+    }
+    100% {
+      background-position: 200% 50%;
+    }
+  }
+
+  .stage-enter {
+    animation: stage-enter 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .stage-pop {
+    animation: stage-pop 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .stage-shake {
+    animation: stage-shake 0.35s ease-in-out both;
+  }
+
+  .stage-ripple {
+    animation: stage-ripple 1.6s ease-out infinite;
+  }
+
+  .stage-sweep {
+    background-size: 200% 100%;
+    animation: running-sweep 2s linear infinite;
+  }
+}
