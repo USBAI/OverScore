@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useDaysAhead, useLeagueUpcoming, useLiveMatches, useTeamSearch } from './useMatchesQuery';
 import { MatchCard } from './MatchCard';
 import { MatchFilters, type DateFilter } from './MatchFilters';
@@ -65,6 +66,7 @@ function daysForFilter(f: DateFilter): number {
 }
 
 export function MatchesPage() {
+  const qc = useQueryClient();
   const [leagueId, setLeagueId] = useState<string>('all');
   const [dateFilter, setDateFilter] = useState<DateFilter>('week');
   const [liveOnly, setLiveOnly] = useState<boolean>(false);
@@ -84,11 +86,9 @@ export function MatchesPage() {
   // Data sources
   const liveQ = useLiveMatches(true);
   // Worldwide daily feed — used as PRIMARY source when leagueId === 'all',
-  // and as a SUPPLEMENT when a specific league is picked + date filter is narrow (today/tomorrow).
-  const needsDayFeed =
-    !liveOnly &&
-    !searching &&
-    (isAllLeagues || dateFilter === 'today' || dateFilter === 'tomorrow');
+  // and as a SUPPLEMENT for specific leagues so we always have fixtures even when
+  // `eventsnextleague.php` is patchy on the free key.
+  const needsDayFeed = !liveOnly && !searching;
   const dayFeedQ = useDaysAhead(daysToFetch, needsDayFeed);
   // Per-league upcoming list — only when a specific league is selected
   const upcomingQ = useLeagueUpcoming(leagueId, !liveOnly && !searching && !isAllLeagues);
@@ -116,15 +116,13 @@ export function MatchesPage() {
       // Primary: worldwide daily feed
       pool = [...(dayFeedQ.data ?? [])];
     } else {
-      // Primary: per-league next events
+      // Merge BOTH: per-league next events AND day-feed filtered to this league.
+      // The league-next endpoint misses many fixtures on the free key, while the
+      // day-feed sometimes misses the league label for some events — using both
+      // together makes the specific-league view reliable.
       pool = [...(upcomingQ.data ?? [])];
-      // Supplement with today's / tomorrow's world feed filtered to this league, so
-      // narrow-date filters never come up empty because the league's "next 15" list
-      // didn't happen to include one of those days.
-      if (needsDayFeed) {
-        for (const m of dayFeedQ.data ?? []) {
-          if (m.leagueId === leagueId) pool.push(m);
-        }
+      for (const m of dayFeedQ.data ?? []) {
+        if (m.leagueId === leagueId) pool.push(m);
       }
     }
 
@@ -138,7 +136,11 @@ export function MatchesPage() {
       pool.push(m);
     }
 
-    const deduped = dedup(pool);
+    // Belt-and-braces: when a specific league is selected, drop anything that
+    // somehow snuck in from another league. This guarantees the league filter
+    // is always honored regardless of upstream API quirks.
+    const leagueFiltered = isAllLeagues ? pool : pool.filter((m) => m.leagueId === leagueId);
+    const deduped = dedup(leagueFiltered);
     const filtered = applyDateFilter(deduped, dateFilter);
     return { matches: sortMatches(filtered), liveCount: live.length };
   }, [
@@ -154,13 +156,27 @@ export function MatchesPage() {
     needsDayFeed,
   ]);
 
+  // Pre-seed each visible match into the ['event', id] cache so the detail page
+  // has instant data and is resilient to lookupevent.php failures.
+  useEffect(() => {
+    for (const m of matches) {
+      const key = ['event', m.id] as const;
+      if (!qc.getQueryData(key)) {
+        qc.setQueryData(key, m);
+      }
+    }
+  }, [matches, qc]);
+
+  // For a specific league we now ALWAYS run both upcomingQ + dayFeedQ. Only show
+  // the skeleton if BOTH are loading (and neither has data yet) — so as soon as
+  // one source returns, we can render.
   const isLoading = liveOnly
     ? liveQ.isLoading
     : searching
       ? searchQ.isLoading
       : isAllLeagues
         ? dayFeedQ.isLoading
-        : upcomingQ.isLoading || (needsDayFeed && dayFeedQ.isLoading);
+        : upcomingQ.isLoading && dayFeedQ.isLoading;
 
   const error = (liveOnly
     ? liveQ.error
@@ -168,7 +184,9 @@ export function MatchesPage() {
       ? searchQ.error
       : isAllLeagues
         ? dayFeedQ.error
-        : (upcomingQ.error ?? (needsDayFeed ? dayFeedQ.error : null))) as Error | null;
+        : upcomingQ.error && dayFeedQ.error
+          ? upcomingQ.error
+          : null) as Error | null;
 
   const isFetching = liveOnly
     ? liveQ.isFetching
@@ -176,7 +194,7 @@ export function MatchesPage() {
       ? searchQ.isFetching
       : isAllLeagues
         ? dayFeedQ.isFetching
-        : upcomingQ.isFetching || (needsDayFeed && dayFeedQ.isFetching);
+        : upcomingQ.isFetching || dayFeedQ.isFetching;
 
   const handleRefresh = () => {
     liveQ.refetch();
@@ -184,7 +202,7 @@ export function MatchesPage() {
     else if (isAllLeagues) dayFeedQ.refetch();
     else {
       upcomingQ.refetch();
-      if (needsDayFeed) dayFeedQ.refetch();
+      dayFeedQ.refetch();
     }
   };
 
@@ -227,8 +245,15 @@ export function MatchesPage() {
       />
 
       <div className="flex items-baseline justify-between gap-2 px-1">
-        <h2 className="font-display text-sm font-semibold uppercase tracking-[0.14em] text-emerald-800/70">
+        <h2 className="flex items-center gap-2 font-display text-sm font-semibold uppercase tracking-[0.14em] text-emerald-800/70">
           {resultHeading}
+          {isFetching && !isLoading && (
+            <span
+              aria-hidden
+              className="inline-block h-1.5 w-1.5 animate-pulse-live rounded-full bg-emerald-500"
+              title="Refreshing"
+            />
+          )}
         </h2>
         <span className="text-xs text-muted-foreground">{matches.length} shown</span>
       </div>

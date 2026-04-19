@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { lookupEvent } from '@/api/sportsdb';
-import type { CachedPrediction, StageResult } from '@/api/types';
+import type { CachedPrediction, Match, StageResult } from '@/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -40,17 +40,60 @@ function teamInitials(name: string) {
     .join('');
 }
 
+/**
+ * Find the match the user clicked in any cached matches list (upcoming / live /
+ * team-search / days-ahead). Prevents "Match not found" when lookupevent.php is
+ * flaky while the user obviously just saw this exact fixture in the list.
+ */
+function useMatchFromCache(id: string): Match | null {
+  const qc = useQueryClient();
+  return useMemo(() => {
+    if (!id) return null;
+    const caches = qc.getQueriesData<Match[] | { matches: Match[] }>({});
+    for (const [, data] of caches) {
+      if (!data) continue;
+      const list: Match[] = Array.isArray(data) ? data : Array.isArray((data as { matches?: Match[] }).matches) ? (data as { matches: Match[] }).matches : [];
+      const hit = list.find((m) => m?.id === id);
+      if (hit) return hit;
+    }
+    return null;
+  }, [qc, id]);
+}
+
 export function MatchDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
 
-  const { data: match, isLoading, error } = useQuery({
+  const cachedFromList = useMatchFromCache(id);
+
+  const {
+    data: match,
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ['event', id],
-    queryFn: ({ signal }) => lookupEvent(id, signal),
+    queryFn: async ({ signal }) => {
+      try {
+        const fresh = await lookupEvent(id, signal);
+        if (fresh) return fresh;
+      } catch (err) {
+        // If network/SportsDB fails but we have it from the list, surface that so
+        // the user isn't stuck on a blank "not found" screen.
+        if (cachedFromList) return cachedFromList;
+        throw err;
+      }
+      // lookup returned null — fall back to list cache if available
+      if (cachedFromList) return cachedFromList;
+      return null;
+    },
     enabled: Boolean(id),
+    retry: 2,
+    retryDelay: (attempt) => Math.min(1500 * 2 ** attempt, 6000),
+    placeholderData: cachedFromList ?? undefined,
   });
 
-  const homeBadge = useTeamBadge(match?.home.id ?? '', match?.home.badge ?? null);
-  const awayBadge = useTeamBadge(match?.away.id ?? '', match?.away.badge ?? null);
+  const effectiveForBadges = match ?? cachedFromList;
+  const homeBadge = useTeamBadge(effectiveForBadges?.home.id ?? '', effectiveForBadges?.home.badge ?? null);
+  const awayBadge = useTeamBadge(effectiveForBadges?.away.id ?? '', effectiveForBadges?.away.badge ?? null);
 
   const [stages, setStages] = useState<StageResult[]>(INITIAL_STAGES);
   const [prediction, setPrediction] = useState<CachedPrediction | null>(() => storageGet<CachedPrediction>(cacheKey(id)));
@@ -118,22 +161,32 @@ export function MatchDetailPage() {
     return Math.round((Date.now() - prediction.createdAt) / 60000);
   }, [prediction]);
 
+  // If the fetch failed but we have the match from the list cache, use it anyway.
+  // Alias to `match` so the existing JSX below keeps working.
+  const matchForRender: Match | null = match ?? cachedFromList;
+
   return (
     <div className="space-y-6">
       <Button asChild variant="ghost" size="sm">
         <Link to="/matches">← Back to matches</Link>
       </Button>
 
-      {isLoading ? (
+      {isLoading && !matchForRender ? (
         <Skeleton className="h-40 w-full" />
-      ) : error || !match ? (
+      ) : !matchForRender ? (
         <Card className="p-6">
           <div className="font-medium text-emerald-950">Match not found</div>
           <div className="text-sm text-muted-foreground">
             {(error as Error | undefined)?.message ?? 'The event id may be invalid.'}
           </div>
+          <div className="mt-2 text-xs text-muted-foreground">
+            If this keeps happening, go back to the matches list and try refreshing.
+          </div>
         </Card>
       ) : (
+        (() => {
+          const match = matchForRender;
+          return (
         <>
           {/* Match header */}
           <Card className="p-6">
@@ -180,20 +233,33 @@ export function MatchDetailPage() {
                 )}
                 {match.kickoffIso && (
                   <div className="mt-2 flex flex-col items-center gap-1">
-                    <div className="text-xs font-medium text-emerald-900/90">
-                      {formatKickoffDate(match.kickoffIso)}
+                    {match.status === 'live' || match.status === 'halftime' ? (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-[hsl(var(--live))]/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-[hsl(var(--live))]">
+                        <span
+                          aria-hidden
+                          className="inline-block h-1.5 w-1.5 animate-pulse-live rounded-full bg-[hsl(var(--live))]"
+                        />
+                        {match.status === 'halftime'
+                          ? 'Half-time'
+                          : `Live · ${match.minute ?? '?'}ʹ`}
+                      </span>
+                    ) : match.status === 'finished' ? (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200/80 bg-emerald-50/70 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-700">
+                        Full-time
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200/80 bg-emerald-50/70 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-700">
+                        <span
+                          aria-hidden
+                          className="inline-block h-1.5 w-1.5 animate-pulse-live rounded-full bg-emerald-500"
+                        />
+                        {formatRelative(match.kickoffIso)}
+                      </span>
+                    )}
+                    <div className="text-[11px] text-muted-foreground">
+                      {formatKickoffDate(match.kickoffIso)} · {formatKickoffTime(match.kickoffIso)}
+                      {formatTimeZone(match.kickoffIso) && ` (${formatTimeZone(match.kickoffIso)})`}
                     </div>
-                    {match.status !== 'live' &&
-                      match.status !== 'halftime' &&
-                      match.status !== 'finished' && (
-                        <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200/80 bg-emerald-50/70 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-700">
-                          <span
-                            aria-hidden
-                            className="inline-block h-1.5 w-1.5 animate-pulse-live rounded-full bg-emerald-500"
-                          />
-                          {formatRelative(match.kickoffIso)}
-                        </span>
-                      )}
                   </div>
                 )}
                 {match.venue && (
@@ -276,6 +342,8 @@ export function MatchDetailPage() {
             </div>
           )}
         </>
+          );
+        })()
       )}
 
       <AbortConfirmDialog

@@ -33,23 +33,104 @@ export const ALL_LEAGUE_IDS = POPULAR_LEAGUES.filter((l) => l.id !== 'all').map(
 
 // ---------- low-level fetch ----------
 
-async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
-  if (!res.ok) {
-    throw new Error(`SportsDB ${res.status} ${res.statusText} — ${url}`);
+/** Sleep helper that respects AbortSignal. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Fetch wrapper with retries for transient failures.
+ * Safari often returns "Load failed" (a bare TypeError) when bursts of parallel
+ * requests to thesportsdb hit the network layer — retrying with backoff recovers.
+ */
+async function getJson<T>(url: string, init?: RequestInit, retries = 2): Promise<T> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, init);
+      if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+        throw new Error(`SportsDB ${res.status} ${res.statusText}`);
+      }
+      if (!res.ok) {
+        throw new Error(`SportsDB ${res.status} ${res.statusText} — ${url}`);
+      }
+      return (await res.json()) as T;
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') throw err;
+      lastErr = err;
+      if (attempt < retries) {
+        const backoff = 300 * Math.pow(2, attempt); // 300ms, 600ms
+        await sleep(backoff, init?.signal ?? undefined);
+        continue;
+      }
+    }
   }
-  return (await res.json()) as T;
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+/** Run `tasks` with at most `concurrency` in-flight at once. Preserves input order. */
+async function runThrottled<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+): Promise<PromiseSettledResult<T>[]> {
+  const results: PromiseSettledResult<T>[] = Array.from({ length: tasks.length });
+  let cursor = 0;
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= tasks.length) return;
+      try {
+        const v = await tasks[i]();
+        results[i] = { status: 'fulfilled', value: v };
+      } catch (reason) {
+        results[i] = { status: 'rejected', reason };
+      }
+    }
+  };
+  const n = Math.min(concurrency, tasks.length);
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
 }
 
 // ---------- helpers ----------
 
+/**
+ * Normalize an assumed-UTC timestamp string into one `new Date(...)` accepts
+ * on every browser (Safari rejects 'YYYY-MM-DD HH:MM:SS' — the space breaks it).
+ */
+function normalizeUtcIso(raw: string): string {
+  let s = raw.trim();
+  // Replace the date/time separator space with 'T'
+  s = s.replace(' ', 'T');
+  // Ensure a timezone designator is present (treat as UTC if absent)
+  const hasTz = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(s);
+  if (!hasTz) s = `${s}Z`;
+  return s;
+}
+
 function parseKickoffIso(e: SdbEvent): string | null {
   if (e.strTimestamp) {
-    const d = new Date(e.strTimestamp);
+    const d = new Date(normalizeUtcIso(e.strTimestamp));
     if (!Number.isNaN(d.getTime())) return d.toISOString();
   }
   if (e.dateEvent && e.strTime) {
-    const d = new Date(`${e.dateEvent}T${e.strTime}Z`);
+    // strTime may arrive as "HH:MM" or "HH:MM:SS", UTC per TheSportsDB docs.
+    const time = e.strTime.length === 5 ? `${e.strTime}:00` : e.strTime;
+    const d = new Date(normalizeUtcIso(`${e.dateEvent} ${time}`));
     if (!Number.isNaN(d.getTime())) return d.toISOString();
   }
   if (e.dateEvent) {
@@ -133,20 +214,66 @@ export async function lookupTeam(teamId: string, signal?: AbortSignal): Promise<
  * v2 livescore/soccer — returns ALL currently-live soccer matches.
  * Note: CORS policy from browser prevents using X-API-KEY header,
  * so we use query parameter instead for the public key.
+ *
+ * Strategy:
+ *   1) Try v2 livescore/soccer (the purpose-built endpoint).
+ *   2) If that returns nothing or errors, fall back to today's eventsday.php
+ *      filtered to matches currently in play — so live-only is never falsely empty.
  */
 export async function getLiveSoccer(signal?: AbortSignal): Promise<Match[]> {
-  try {
-    const url = KEY === '3' ? `${V2}/livescore/soccer?key=123` : `${V2}/livescore/soccer`;
-    const res = await fetch(url, {
-      ...(KEY !== '3' && { headers: { 'X-API-KEY': KEY } }),
-      signal,
-    });
-    if (!res.ok) return [];
-    const data = (await res.json()) as { livescore: SdbEvent[] | null };
-    return (data.livescore ?? []).map(toMatch);
-  } catch {
-    return [];
+  const v2Url = KEY === '3' ? `${V2}/livescore/soccer?key=123` : `${V2}/livescore/soccer`;
+
+  // Attempt 1: v2 endpoint with retry/backoff
+  const tryV2 = async (): Promise<Match[] | null> => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(v2Url, {
+          ...(KEY !== '3' && { headers: { 'X-API-KEY': KEY } }),
+          signal,
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { livescore?: SdbEvent[] | null; events?: SdbEvent[] | null };
+          const arr = data.livescore ?? data.events ?? [];
+          return arr.map(toMatch);
+        }
+        if (res.status === 429 || res.status >= 500) {
+          await sleep(400 * (attempt + 1), signal);
+          continue;
+        }
+        return null;
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') throw err;
+        await sleep(400 * (attempt + 1), signal);
+      }
+    }
+    return null;
+  };
+
+  // Attempt 2: today's soccer events, keep only the ones currently in play
+  const tryDayFallback = async (): Promise<Match[]> => {
+    const today = new Date();
+    const ymd = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    try {
+      const events = await getEventsOnDay(ymd, signal);
+      return events.filter((m) => m.status === 'live' || m.status === 'halftime');
+    } catch {
+      return [];
+    }
+  };
+
+  const v2 = await tryV2();
+  if (v2 && v2.length > 0) return v2;
+  const fallback = await tryDayFallback();
+  // Merge v2 (possibly empty) with fallback, dedup by id, so we never lose data.
+  const pool = [...(v2 ?? []), ...fallback];
+  const seen = new Set<string>();
+  const out: Match[] = [];
+  for (const m of pool) {
+    if (seen.has(m.id)) continue;
+    seen.add(m.id);
+    out.push(m);
   }
+  return out;
 }
 
 /** All soccer events on a given calendar day (YYYY-MM-DD). */
@@ -209,9 +336,11 @@ export async function searchTeamFixtures(
   const teams = await searchTeams(query, signal);
   if (teams.length === 0) return { teams: [], matches: [] };
   const soccerTeams = teams.slice(0, 5); // cap to limit requests
-  const all = await Promise.allSettled(
-    soccerTeams.flatMap((t) => [getNextByTeam(t.idTeam, signal), getLastByTeam(t.idTeam, signal)]),
-  );
+  const tasks = soccerTeams.flatMap((t) => [
+    () => getNextByTeam(t.idTeam, signal),
+    () => getLastByTeam(t.idTeam, signal),
+  ]);
+  const all = await runThrottled(tasks, 3);
   const seen = new Set<string>();
   const matches: Match[] = [];
   for (const r of all) {
@@ -236,7 +365,8 @@ export async function getEventsForDaysAhead(days: number, signal?: AbortSignal):
     d.setDate(today.getDate() + i);
     dates.push(ymd(d));
   }
-  const res = await Promise.allSettled(dates.map((d) => getEventsOnDay(d, signal)));
+  // Throttle concurrency to 3 to keep Safari + thesportsdb happy
+  const res = await runThrottled(dates.map((d) => () => getEventsOnDay(d, signal)), 3);
   const seen = new Set<string>();
   const out: Match[] = [];
   for (const r of res) {
