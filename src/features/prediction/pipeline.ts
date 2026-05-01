@@ -70,16 +70,31 @@ export async function runPredictionPipeline(
   eventId: string,
   emit: StageEmit,
   signal?: AbortSignal,
+  preloadedMatch?: Match | null,
 ): Promise<CachedPrediction> {
   const start = Date.now();
 
   // ─── Stage 1: match ────────────────────────────────────────────────────
+  // Prefer the cached match we already have from the matches list, because
+  // TheSportsDB's free-key `lookupevent.php` sometimes returns a stale sample
+  // event (Liverpool vs Swansea 2014) instead of the requested id. Our
+  // `lookupEvent` helper rejects those, which means it can return null — in
+  // that case we fall back to the preloaded match the caller passed in.
   let match: Match | null = null;
   {
     const s: StageResult = { ...mkStage('s1-match'), status: 'running', startedAt: Date.now() };
     emit(s);
     try {
-      match = await lookupEvent(eventId, signal);
+      // Try the authoritative lookup first (it may fail / return null for the
+      // sample-event reasons above).
+      let looked: Match | null = null;
+      try {
+        looked = await lookupEvent(eventId, signal);
+      } catch {
+        // Network / transient error — we'll fall back to preloadedMatch.
+        looked = null;
+      }
+      match = looked ?? preloadedMatch ?? null;
       if (!match) throw new Error('Match not found in TheSportsDB.');
       s.status = 'done';
       s.endedAt = Date.now();

@@ -62,11 +62,14 @@ async function getJson<T>(url: string, init?: RequestInit, retries = 2): Promise
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, init);
+      // Never leak the raw API URL into user-facing errors — it contains a
+      // third-party endpoint path like `eventsday.php` that has nothing to do
+      // with our app. Keep only the HTTP status so messages stay clean.
       if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
         throw new Error(`SportsDB ${res.status} ${res.statusText}`);
       }
       if (!res.ok) {
-        throw new Error(`SportsDB ${res.status} ${res.statusText} — ${url}`);
+        throw new Error(`SportsDB ${res.status} ${res.statusText}`);
       }
       return (await res.json()) as T;
     } catch (err) {
@@ -141,18 +144,68 @@ function parseKickoffIso(e: SdbEvent): string | null {
 }
 
 function parseStatus(e: SdbEvent): { status: MatchStatus; minute: number | null } {
-  const raw = (e.strStatus ?? '').toUpperCase();
+  const rawStatus = (e.strStatus ?? '').trim();
+  const rawProgress = (e.strProgress ?? '').trim();
+  const upper = rawStatus.toUpperCase();
+
   if (e.strPostponed === 'yes') return { status: 'postponed', minute: null };
-  if (raw === 'FT' || raw === 'MATCH FINISHED' || raw === 'FINISHED' || raw === 'AET' || raw === 'PEN') {
+
+  if (upper === 'FT' || upper === 'MATCH FINISHED' || upper === 'FINISHED' || upper === 'AET' || upper === 'PEN') {
     return { status: 'finished', minute: null };
   }
-  if (raw === 'HT' || raw === 'HALF TIME') return { status: 'halftime', minute: 45 };
-  if (raw === '1H' || raw === '2H' || raw === 'ET' || raw === 'LIVE' || raw === 'IN PLAY') {
-    const min = Number(e.strProgress ?? '');
-    return { status: 'live', minute: Number.isFinite(min) ? min : null };
+  if (upper === 'HT' || upper === 'HALF TIME' || upper === 'HALFTIME') {
+    return { status: 'halftime', minute: 45 };
   }
-  if (raw === 'NS' || raw === '' || raw === 'SCHEDULED') return { status: 'scheduled', minute: null };
-  if (raw === 'CANC' || raw === 'CANCELLED') return { status: 'cancelled', minute: null };
+
+  // Pull a minute out of something that's supposed to carry one.
+  // Accepts "82", "82'", "45+2", "90+3 ".
+  // REJECTS half-indicators like "1H" / "2H" (those must not parse to 1/2).
+  const extractMinute = (s: string): number | null => {
+    if (!s) return null;
+    const trimmed = s.trim();
+    // Valid if the string is purely a number (optionally with ' or + suffix).
+    // Anything with a letter like H/E/T/etc. is a status keyword, not a minute.
+    if (!/^\d+(\s*\+\s*\d+)?\s*[' ]?\s*$/.test(trimmed)) return null;
+    const match = trimmed.match(/(\d+)(?:\s*\+\s*(\d+))?/);
+    if (!match) return null;
+    const base = Number(match[1]);
+    const added = match[2] ? Number(match[2]) : 0;
+    if (!Number.isFinite(base)) return null;
+    return base + (Number.isFinite(added) ? added : 0);
+  };
+
+  const progressMin = extractMinute(rawProgress);
+  const statusMin = extractMinute(rawStatus);
+
+  const isLiveKeyword =
+    upper === '1H' ||
+    upper === '2H' ||
+    upper === 'ET' ||
+    upper === 'LIVE' ||
+    upper === 'IN PLAY' ||
+    upper === 'INPLAY' ||
+    upper === 'PLAYING' ||
+    upper === 'INPROGRESS';
+
+  // If either field gives us a plausible minute (1–130), treat the match as
+  // live — even if strStatus is a bare number like "82" that doesn't match
+  // any textual keyword. We prefer strProgress when it's non-zero, because
+  // "0" in strProgress often just means "API didn't populate this field yet".
+  const firstValid = [progressMin, statusMin].find((m) => m != null && m > 0 && m <= 130);
+  const aMinute = firstValid ?? progressMin ?? statusMin ?? null;
+
+  if (isLiveKeyword || (firstValid != null)) {
+    // Drop a bogus 0 — we'd rather render "?'" than "0'".
+    const reportedMinute = aMinute != null && aMinute > 0 ? aMinute : null;
+    return { status: 'live', minute: reportedMinute };
+  }
+
+  if (upper === 'NS' || upper === '' || upper === 'SCHEDULED' || upper === 'NOT STARTED') {
+    return { status: 'scheduled', minute: null };
+  }
+  if (upper === 'CANC' || upper === 'CANCELLED' || upper === 'CANCELED') {
+    return { status: 'cancelled', minute: null };
+  }
   return { status: 'unknown', minute: null };
 }
 
@@ -189,7 +242,12 @@ export async function getPastByLeague(leagueId: string, signal?: AbortSignal): P
 export async function lookupEvent(eventId: string, signal?: AbortSignal): Promise<Match | null> {
   const data = await getJson<{ events: SdbEvent[] | null }>(`${V1}/lookupevent.php?id=${eventId}`, { signal });
   const first = data.events?.[0];
-  return first ? toMatch(first) : null;
+  if (!first) return null;
+  // TheSportsDB's free key ("3") sometimes returns a sample event (historically a
+  // 2014 Liverpool vs Swansea match at Anfield) regardless of the requested id.
+  // Reject any response whose idEvent doesn't match the one we asked for.
+  if (String(first.idEvent) !== String(eventId)) return null;
+  return toMatch(first);
 }
 
 export async function getNextByTeam(teamId: string, signal?: AbortSignal): Promise<Match[]> {

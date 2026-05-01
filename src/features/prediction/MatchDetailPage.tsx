@@ -10,7 +10,7 @@ import { Card } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { AbortConfirmDialog } from '@/components/AbortConfirmDialog';
 import { formatKickoffDate, formatKickoffTime, formatRelative, formatTimeZone } from '@/lib/utils';
-import { storageDel, storageGet, storageSet } from '@/lib/storage';
+import { storageDel, storageGet, storageGetTtl, storageSet } from '@/lib/storage';
 import { useNavigationGuard } from '@/hooks/useNavigationGuard';
 import { useTeamBadge } from '@/hooks/useTeamBadge';
 import { runPredictionPipeline } from './pipeline';
@@ -42,20 +42,30 @@ function teamInitials(name: string) {
 
 /**
  * Find the match the user clicked in any cached matches list (upcoming / live /
- * team-search / days-ahead). Prevents "Match not found" when lookupevent.php is
- * flaky while the user obviously just saw this exact fixture in the list.
+ * team-search / days-ahead), then fall back to localStorage (which survives
+ * page refreshes, unlike react-query's in-memory cache). Prevents "Match not
+ * found" when lookupevent.php is flaky or restricted on the free SportsDB key,
+ * while the user obviously just saw this exact fixture in the list.
  */
 function useMatchFromCache(id: string): Match | null {
   const qc = useQueryClient();
   return useMemo(() => {
     if (!id) return null;
+    // 1) Scan react-query caches
     const caches = qc.getQueriesData<Match[] | { matches: Match[] }>({});
     for (const [, data] of caches) {
       if (!data) continue;
-      const list: Match[] = Array.isArray(data) ? data : Array.isArray((data as { matches?: Match[] }).matches) ? (data as { matches: Match[] }).matches : [];
+      const list: Match[] = Array.isArray(data)
+        ? data
+        : Array.isArray((data as { matches?: Match[] }).matches)
+          ? (data as { matches: Match[] }).matches
+          : [];
       const hit = list.find((m) => m?.id === id);
       if (hit) return hit;
     }
+    // 2) Fall back to localStorage (written by MatchesPage for every visible card)
+    const stored = storageGetTtl<Match>(`match:${id}`);
+    if (stored && stored.id === id) return stored;
     return null;
   }, [qc, id]);
 }
@@ -109,6 +119,29 @@ export function MatchDetailPage() {
     setRunError(null);
   }, [id]);
 
+  // Guard against stale predictions that were cached before the sample-event
+  // guard existed. If the cached prediction's team ids don't match the actual
+  // match we're viewing (e.g. Bournemouth vs Leeds but the cache is Liverpool
+  // vs Swansea because lookupevent.php returned the sample fallback), purge
+  // the bad cache entry so the user can run a fresh analysis.
+  useEffect(() => {
+    if (!prediction) return;
+    const effective = match ?? cachedFromList;
+    if (!effective) return;
+    const homeId = String(prediction.homeForm.teamId);
+    const awayId = String(prediction.awayForm.teamId);
+    const realHomeId = String(effective.home.id);
+    const realAwayId = String(effective.away.id);
+    const matches =
+      (homeId === realHomeId && awayId === realAwayId) ||
+      (homeId === realAwayId && awayId === realHomeId); // be lenient to home/away swaps
+    if (!matches) {
+      storageDel(cacheKey(id));
+      setPrediction(null);
+      setStages(INITIAL_STAGES);
+    }
+  }, [prediction, match, cachedFromList, id]);
+
   const handleEmit = useCallback((stage: StageResult) => {
     setStages((prev) => {
       const idx = prev.findIndex((s) => s.id === stage.id);
@@ -119,6 +152,10 @@ export function MatchDetailPage() {
     });
   }, []);
 
+  // Pass the pre-seeded match into the pipeline so stage 1 never breaks even
+  // when `lookupevent.php` is unreachable or returns the sample event.
+  const preloadedMatch: Match | null = match ?? cachedFromList ?? null;
+
   const runAnalysis = useCallback(async () => {
     if (!id) return;
     setPrediction(null);
@@ -128,7 +165,12 @@ export function MatchDetailPage() {
     const controller = new AbortController();
     controllerRef.current = controller;
     try {
-      const result = await runPredictionPipeline(id, handleEmit, controller.signal);
+      const result = await runPredictionPipeline(
+        id,
+        handleEmit,
+        controller.signal,
+        preloadedMatch ?? undefined,
+      );
       storageSet(cacheKey(id), result);
       setPrediction(result);
       toast.success('AI verdict ready');
@@ -143,7 +185,7 @@ export function MatchDetailPage() {
       controllerRef.current = null;
       setRunning(false);
     }
-  }, [id, handleEmit]);
+  }, [id, handleEmit, preloadedMatch]);
 
   const handleAbort = useCallback(() => {
     controllerRef.current?.abort();
@@ -163,7 +205,7 @@ export function MatchDetailPage() {
 
   // If the fetch failed but we have the match from the list cache, use it anyway.
   // Alias to `match` so the existing JSX below keeps working.
-  const matchForRender: Match | null = match ?? cachedFromList;
+  const matchForRender: Match | null = preloadedMatch;
 
   return (
     <div className="space-y-6">
